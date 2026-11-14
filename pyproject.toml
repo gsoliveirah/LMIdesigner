@@ -1,0 +1,15 @@
+[project]
+name = "alloy-inverse-design"
+version = "0.1.0"
+description = "Design inverso de aços AHSS via PINN + CALPHAD + NSGA-III"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["slow: testes que dependem de pycalphad/bases TDB"]
+filterwarnings = ["ignore::UserWarning:pycalphad.*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

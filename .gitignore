@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Dados e artefatos gerados (mantém a estrutura de diretórios)
+data/raw/*
+data/synthetic/*
+data/processed/*
+models/*
+!data/**/.gitkeep
+!models/.gitkeep
+
+# Bases termodinâmicas (geralmente licenciadas)
+*.tdb
+*.TDB

@@ -1,0 +1,22 @@
+# Núcleo numérico
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11            # qmc.LatinHypercube
+
+# Termodinâmica computacional
+pycalphad>=0.11        # requer base TDB de aços (ex.: MatCalc mc_fe, Thermo-Calc TCFE)
+
+# Machine learning
+torch>=2.2
+scikit-learn>=1.4      # IsolationForest, GroupKFold, métricas
+optuna>=3.5
+
+# Otimização multiobjetivo
+pymoo>=0.6.1           # NSGA-III
+
+# Interface
+streamlit>=1.40
+plotly>=5.18
+
+# Testes
+pytest>=8.0
