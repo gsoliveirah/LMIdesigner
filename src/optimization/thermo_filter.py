@@ -1,13 +1,15 @@
-"""Filtro de estabilidade de fases e risco metalúrgico.
+"""Filtro de estabilidade de fases e risco metalúrgico para ligas de Al secundárias.
 
 Duas camadas:
 
 1. **Triagem rápida vetorizada** (:meth:`ThermoFilter.evaluate_batch`) —
-   regras metalúrgicas empíricas usadas *dentro* do laço do NSGA-III
-   (milhares de avaliações por geração).
+   regras metalúrgicas usadas *dentro* do laço do NSGA-III (milhares de
+   avaliações por geração): química do Fe (Fe crítico, Mn/Fe, sludge),
+   fusão incipiente na solubilização, intervalo de solidificação, impurezas
+   acumulativas (Zn, Ni), modificadores e refinadores.
 2. **Validação CALPHAD** (:meth:`ThermoFilter.validate_with_calphad`) —
-   equilíbrio completo apenas no conjunto de Pareto final, verificando fases
-   indesejadas (σ, Laves, µ…) e a fração de austenita intercrítica.
+   equilíbrio completo apenas no conjunto de Pareto final: líquido na T de
+   solubilização e intermetálicos primários (sludge) na T do forno de espera.
 
 Cada regra produz um *excesso relativo* ≥ 0; o ``risk_score`` agrega os
 excessos ponderados pela severidade.
@@ -88,6 +90,15 @@ def _comp(df: pd.DataFrame) -> dict[str, np.ndarray]:
     return {el: df[el].to_numpy(float) if el in df else np.zeros(len(df)) for el in ELEMENTS}
 
 
+def _dissolution_ratio(df: pd.DataFrame) -> np.ndarray:
+    """(Cu_d + Mg_d)/(Cu + Mg) na T de solubilização."""
+    comp = _comp(df)
+    T = _col("T_solution_C", 540.0)(df)
+    cu_d, mg_d = met.dissolved_solutes(comp, T)
+    total = comp["Cu"] + comp["Mg"]
+    return np.where(total > 1e-6, (np.asarray(cu_d) + np.asarray(mg_d)) / np.maximum(total, 1e-6), 1.0)
+
+
 class ThermoFilter:
     """Avalia estabilidade de fases e riscos de processamento/aplicação."""
 
@@ -103,57 +114,66 @@ class ThermoFilter:
     # ------------------------------------------------------------------ regras
     def _build_rules(self) -> list[Rule]:
         L = self.limits
-        ac1 = lambda df: np.asarray(met.ac1_andrews(_comp(df)), float)  # noqa: E731
-        ac3 = lambda df: np.asarray(met.ac3_andrews(_comp(df)), float)  # noqa: E731
-        has_T = lambda df: np.full(len(df), "T_anneal_C" in df)  # noqa: E731
+        t_inc = lambda df: np.asarray(met.incipient_melting_temperature(_comp(df)), float)  # noqa: E731
+        has = lambda col: (lambda df: np.full(len(df), col in df))  # noqa: E731
         return [
-            Rule("CEQ_WELDABILITY", Severity.CRITICAL,
-                 "Carbono equivalente IIW acima do limite de soldabilidade (soldagem a ponto/HAZ).",
-                 lambda df: np.asarray(met.carbon_equivalent_iiw(_comp(df)), float),
-                 lambda df: L.ceq_iiw_max),
-            Rule("PCM_COLD_CRACKING", Severity.WARNING,
-                 "Pcm elevado: risco de trinca a frio induzida por hidrogênio.",
-                 lambda df: np.asarray(met.pcm_ito_bessyo(_comp(df)), float),
-                 lambda df: L.pcm_max,
-                 applies=lambda df: _col("C")(df) <= 0.18),  # domínio de validade do Pcm
-            Rule("NARROW_INTERCRITICAL_WINDOW", Severity.WARNING,
-                 "Janela intercrítica (Ac3−Ac1) estreita: baixa robustez de processo na linha de recozimento.",
-                 lambda df: ac3(df) - ac1(df), lambda df: L.min_intercritical_window_C, lower=True),
-            Rule("ANNEAL_BELOW_AC1", Severity.CRITICAL,
-                 "Temperatura de recozimento abaixo de Ac1: não há austenita para formar fases duras.",
-                 _col("T_anneal_C", np.inf), ac1, lower=True, applies=has_T),
-            Rule("ANNEAL_GRAIN_COARSENING", Severity.WARNING,
-                 "Recozimento > Ac3 + 50 °C: crescimento de grão austenítico.",
-                 _col("T_anneal_C", -np.inf), lambda df: ac3(df) + 50.0, applies=has_T),
-            Rule("MN_BANDING", Severity.WARNING,
-                 "Mn elevado: segregação/bandeamento e risco de fragilização por H.",
-                 _col("Mn"), lambda df: L.max_mn_banding),
-            Rule("SI_GALVANIZING", Severity.WARNING,
-                 "Si elevado: óxidos superficiais prejudicam a galvanização por imersão.",
-                 _col("Si"), lambda df: L.max_si_galvanizing),
-            Rule("AL_CASTING", Severity.WARNING,
-                 "Al elevado: entupimento de válvula no lingotamento contínuo / AlN.",
-                 _col("Al"), lambda df: L.max_al_casting),
-            Rule("B_EMBRITTLEMENT", Severity.CRITICAL,
-                 "B acima do limite: boretos em contorno de grão (fragilização).",
-                 _col("B"), lambda df: L.max_b_embrittlement),
-            Rule("B_UNPROTECTED", Severity.WARNING,
-                 "B ativo sem Ti suficiente (Ti/N < 3.42): formação de BN anula a temperabilidade.",
-                 lambda df: _col("Ti")(df) / np.maximum(_col("N")(df), 1e-6),
-                 lambda df: L.min_ti_n_ratio, lower=True,
-                 applies=lambda df: _col("B")(df) > 0.0005),
-            Rule("MICROALLOY_EXCESS", Severity.WARNING,
-                 "Nb+Ti+V elevado: carbonitretos grosseiros, trincas no lingotamento.",
-                 lambda df: _col("Nb")(df) + _col("Ti")(df) + _col("V")(df),
-                 lambda df: L.max_microalloy_sum),
-            Rule("CU_HOT_SHORTNESS", Severity.WARNING,
-                 "Cu sem Ni suficiente: fragilidade a quente (hot shortness).",
-                 lambda df: _col("Cu")(df) / np.maximum(_col("Ni")(df), 1e-3),
-                 lambda df: L.cu_ni_ratio_hot_shortness,
-                 applies=lambda df: _col("Cu")(df) > 0.25),
+            Rule("INCIPIENT_MELTING", Severity.CRITICAL,
+                 "Solubilização acima (ou a < margem) do eutético de menor ponto de fusão: "
+                 "fusão incipiente/\"queima\" de contornos (Al2Cu, fase Q).",
+                 _col("T_solution_C", -np.inf),
+                 lambda df: t_inc(df) - L.incipient_melting_margin_C, applies=has("T_solution_C")),
+            Rule("SLUDGE_FORMATION", Severity.CRITICAL,
+                 "Sludge factor (Fe+2Mn+3Cr) acima do crítico na T de espera: "
+                 "intermetálicos primários sedimentam no forno (perda de Fe/Mn, inclusões duras).",
+                 lambda df: np.asarray(met.sludge_factor(_comp(df)), float),
+                 lambda df: np.asarray(met.critical_sludge_factor(
+                     L.holding_temperature_C, L.sludge_factor_base, L.sludge_factor_slope_per_C), float)),
+            Rule("FE_ABOVE_CRITICAL", Severity.WARNING,
+                 "Fe acima do Fe crítico (Taylor): β-Al5FeSi pré-eutético grosseiro, "
+                 "porosidade de contração e perda de ductilidade.",
+                 _col("Fe"), lambda df: np.asarray(met.critical_iron(_comp(df)), float)),
+            Rule("MN_FE_RATIO_LOW", Severity.WARNING,
+                 "Razão (Mn+2Cr)/Fe < 0.5 com Fe elevado: Fe não neutralizado (β em agulhas).",
+                 lambda df: np.asarray(met.mn_fe_ratio(_comp(df)), float),
+                 lambda df: L.min_mn_fe_ratio, lower=True,
+                 applies=lambda df: _col("Fe")(df) > L.mn_fe_ratio_applies_above_fe),
+            Rule("BETA_PHASE_FRACTION", Severity.WARNING,
+                 "Fração prevista de β-Al5FeSi elevada.",
+                 _col("f_beta_AlFeSi"), lambda df: L.max_beta_fraction, applies=has("f_beta_AlFeSi")),
+            Rule("INCOMPLETE_DISSOLUTION", Severity.WARNING,
+                 "Solubilização insuficiente: Cu/Mg não dissolvidos não contribuem ao endurecimento T6.",
+                 lambda df: _dissolution_ratio(df), lambda df: L.min_dissolution_ratio, lower=True,
+                 applies=has("T_solution_C")),
+            Rule("WIDE_FREEZING_RANGE", Severity.WARNING,
+                 "Intervalo de solidificação largo: porosidade de contração e trinca a quente.",
+                 lambda df: np.asarray(met.freezing_range(_comp(df)), float),
+                 lambda df: L.max_freezing_range_C),
+            Rule("ZN_TRAMP", Severity.WARNING,
+                 "Zn acumulado da sucata acima do limite (trinca a quente, corrosão, normas EN AC).",
+                 _col("Zn"), lambda df: L.max_zn),
+            Rule("NI_TRAMP", Severity.WARNING,
+                 "Ni acumulado acima do limite (intermetálicos Al3Ni, ductilidade).",
+                 _col("Ni"), lambda df: L.max_ni),
+            Rule("CU_CORROSION", Severity.INFO,
+                 "Cu > 1 %: resistência à corrosão reduzida (aceitável para A380/319).",
+                 _col("Cu"), lambda df: L.max_cu_corrosion),
+            Rule("SR_OVERMODIFICATION", Severity.WARNING,
+                 "Sr em excesso: sobremodificação, Al2SrSi2 e porosidade gasosa.",
+                 _col("Sr"), lambda df: L.max_sr),
+            Rule("TI_PRIMARY_TIAL3", Severity.WARNING,
+                 "Ti em excesso: TiAl3 primário (inclusões duras, sedimentação).",
+                 _col("Ti"), lambda df: L.max_ti),
+            Rule("HYPEREUTECTIC", Severity.WARNING,
+                 "Si equivalente próximo/acima do eutético: Si primário, fora da validade do modelo.",
+                 lambda df: np.asarray(met.silicon_equivalent(_comp(df)), float),
+                 lambda df: L.max_si_hypoeutectic),
+            Rule("INCIPIENT_MELTING_CALPHAD", Severity.CRITICAL,
+                 "CALPHAD prevê líquido na temperatura de solubilização.",
+                 _col("f_liquid_eq"), lambda df: 1e-3, applies=has("f_liquid_eq")),
             Rule("UNDESIRED_PHASES_CALPHAD", Severity.CRITICAL,
-                 "CALPHAD prevê fases intermetálicas indesejadas (σ, Laves, µ…).",
-                 _col("f_undesired_eq"), lambda df: L.max_undesired_phase_fraction),
+                 "CALPHAD prevê intermetálicos primários (sludge) no forno de espera.",
+                 _col("f_undesired_eq"), lambda df: L.max_undesired_phase_fraction,
+                 applies=has("f_undesired_eq")),
         ]
 
     # ------------------------------------------------------------------ avaliação
@@ -197,25 +217,31 @@ class ThermoFilter:
                 flags.append(RiskFlag(rule.code, rule.severity, rule.message, float(value[0]), lim))
         batch = self.evaluate_batch(df).iloc[0]
         comp = _comp(df)
+
+        def _f(x: object) -> float:
+            return float(np.asarray(x, dtype=float).ravel()[0])
+
         metrics = {
-            "Ceq_IIW": float(np.asarray(met.carbon_equivalent_iiw(comp))[0]),
-            "Pcm": float(np.asarray(met.pcm_ito_bessyo(comp))[0]),
-            "Ac1_C": float(np.asarray(met.ac1_andrews(comp))[0]),
-            "Ac3_C": float(np.asarray(met.ac3_andrews(comp))[0]),
-            "Ms_C": float(np.asarray(met.ms_andrews(comp))[0]),
+            "Si_eq": _f(met.silicon_equivalent(comp)),
+            "T_liquidus_C": _f(met.liquidus_temperature(comp)),
+            "T_incipient_C": _f(met.incipient_melting_temperature(comp)),
+            "freezing_range_C": _f(met.freezing_range(comp)),
+            "sludge_factor": _f(met.sludge_factor(comp)),
+            "Mn_Fe_ratio": _f(met.mn_fe_ratio(comp)),
+            "Fe_critical": _f(met.critical_iron(comp)),
         }
         return FilterResult(passed=bool(batch["passed"]), risk_score=float(batch["risk_score"]),
                             flags=flags, metrics=metrics)
 
     def validate_with_calphad(self, df: pd.DataFrame, backend: ThermoBackend | None = None) -> pd.DataFrame:
-        """Recalcula o equilíbrio na T de recozimento e reavalia os riscos.
+        """Recalcula o equilíbrio (solubilização + forno de espera) e reavalia os riscos.
 
-        Adiciona ``f_austenite_eq``, ``C_austenite_eq_wt`` e ``f_undesired_eq``.
+        Adiciona as colunas de :data:`EQ_COLUMNS` (``f_liquid_eq``, ``f_sludge_eq``, …).
         """
         backend = backend or self.backend
         if backend is None:
             raise ValueError("Nenhum backend termodinâmico configurado.")
-        eq = backend.equilibrium_batch(df[list(ELEMENTS)], df["T_anneal_C"].to_numpy(float))
+        eq = backend.equilibrium_batch(df[list(ELEMENTS)], df["T_solution_C"].to_numpy(float))
         merged = pd.concat([df.drop(columns=[c for c in eq.columns if c in df]), eq], axis=1)
         risk = self.evaluate_batch(merged)
         return pd.concat([merged.drop(columns=[c for c in risk.columns if c in merged]), risk], axis=1)

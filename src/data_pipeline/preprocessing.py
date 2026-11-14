@@ -1,4 +1,8 @@
-"""Limpeza, engenharia de features metalúrgicas, outliers e escalonamento."""
+"""Limpeza, engenharia de features metalúrgicas, outliers e escalonamento.
+
+Aplica-se tanto a dados sintéticos (CALPHAD) quanto a dados experimentais de
+fundição (certificados de corrida OES + ensaios de tração).
+"""
 
 from __future__ import annotations
 
@@ -29,30 +33,54 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Features metalúrgicas
 # ---------------------------------------------------------------------------
-def compute_carbon_equivalent(df: pd.DataFrame, method: str = "IIW") -> pd.Series:
-    """Carbono equivalente (``IIW`` ou ``Pcm``)."""
+EQUIVALENT_METHODS: tuple[str, ...] = ("SI_EQ", "SLUDGE", "MN_FE")
+
+
+def compute_c_eq(df: pd.DataFrame, method: str = "SI_EQ") -> pd.Series:
+    """Índice composicional equivalente ("C_eq") para ligas de Al-Si.
+
+    Em aços, o carbono equivalente resume o efeito combinado dos elementos de
+    liga sobre a temperabilidade/soldabilidade. Em ligas de Al-Si secundárias,
+    os índices análogos são:
+
+    * ``SI_EQ``  — Si equivalente (Djurdjevic): efeito combinado dos solutos
+      sobre a liquidus/fluidez (padrão);
+    * ``SLUDGE`` — sludge factor Fe + 2Mn + 3Cr: tendência à formação de
+      intermetálicos primários no forno;
+    * ``MN_FE``  — razão (Mn + 2Cr)/Fe: neutralização do β-Al5FeSi.
+    """
     comp = {el: df[el] for el in ELEMENTS if el in df}
-    if method.upper() == "IIW":
-        return pd.Series(met.carbon_equivalent_iiw(comp), index=df.index, name="Ceq_IIW")
-    if method.upper() == "PCM":
-        return pd.Series(met.pcm_ito_bessyo(comp), index=df.index, name="Pcm")
-    raise ValueError(f"Método de C_eq desconhecido: {method}")
+    key = method.upper()
+    if key == "SI_EQ":
+        return pd.Series(met.silicon_equivalent(comp), index=df.index, name="Si_eq")
+    if key == "SLUDGE":
+        return pd.Series(met.sludge_factor(comp), index=df.index, name="sludge_factor")
+    if key == "MN_FE":
+        return pd.Series(met.mn_fe_ratio(comp), index=df.index, name="Mn_Fe_ratio")
+    raise ValueError(f"Método de C_eq desconhecido: {method} (use {EQUIVALENT_METHODS})")
 
 
 def add_metallurgical_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Adiciona C_eq, Pcm, temperaturas críticas e equivalentes de Schaeffler."""
+    """Adiciona equivalentes, temperaturas características e descritores do Fe/T6."""
     out = df.copy()
     comp = {el: out[el] for el in ELEMENTS if el in out}
-    out["Fe_balance"] = 100.0 - out[[el for el in ELEMENTS if el in out]].sum(axis=1)
-    out["Ceq_IIW"] = compute_carbon_equivalent(out, "IIW")
-    out["Pcm"] = compute_carbon_equivalent(out, "Pcm")
-    out["Ac1_C"] = met.ac1_andrews(comp)
-    out["Ac3_C"] = met.ac3_andrews(comp)
-    out["intercritical_window_C"] = out["Ac3_C"] - out["Ac1_C"]
-    out["Ms_C"] = met.ms_andrews(comp)
-    out["Bs_C"] = met.bs_steven_haynes(comp)
-    cr_eq, ni_eq = met.schaeffler_equivalents(comp)
-    out["Cr_eq"], out["Ni_eq"] = cr_eq, ni_eq
+    out["Al_balance"] = 100.0 - out[[el for el in ELEMENTS if el in out]].sum(axis=1)
+    out["Si_eq"] = compute_c_eq(out, "SI_EQ")
+    out["sludge_factor"] = compute_c_eq(out, "SLUDGE")
+    out["Mn_Fe_ratio"] = compute_c_eq(out, "MN_FE")
+    out["Fe_critical"] = met.critical_iron(comp)
+    out["Fe_excess"] = out["Fe"] - out["Fe_critical"]
+    out["T_liquidus_C"] = met.liquidus_temperature(comp)
+    out["T_incipient_C"] = met.incipient_melting_temperature(comp)
+    out["freezing_range_C"] = out["T_liquidus_C"] - out["T_incipient_C"]
+    if "T_solution_C" in out:
+        out["solution_margin_C"] = out["T_incipient_C"] - out["T_solution_C"]
+    if "cooling_rate_Cps" in out:
+        out["SDAS_um"] = met.sdas_um(out["cooling_rate_Cps"].to_numpy(float))
+    if {"T_aging_C", "t_aging_h"} <= set(out):
+        out["log10_aging_P"] = np.log10(np.asarray(
+            met.aging_parameter(out["T_aging_C"].to_numpy(float), out["t_aging_h"].to_numpy(float),
+                                {"Cu": out["Cu"].to_numpy(float)}), float))
     return out
 
 
@@ -78,7 +106,7 @@ class CleaningReport:
 def clean_dataset(
     df: pd.DataFrame,
     targets: Sequence[str] = TARGETS,
-    max_alloy_sum: float = 15.0,
+    max_alloy_sum: float = 25.0,
     report: CleaningReport | None = None,
 ) -> pd.DataFrame:
     """Limpeza básica de dados experimentais ou sintéticos.
@@ -86,7 +114,7 @@ def clean_dataset(
     * Elementos não reportados -> 0 wt% (convenção de certificados de corrida).
     * Remove linhas sem processo/alvos, composições negativas ou com soma de
       liga acima de ``max_alloy_sum``.
-    * Remove violações físicas: YS > UTS, El <= 0, UTS <= 0.
+    * Remove violações físicas: YS > UTS, El <= 0, UTS <= 0, tempos/taxas <= 0.
     * Remove duplicatas exatas.
     """
     report = report if report is not None else CleaningReport()
@@ -117,8 +145,9 @@ def clean_dataset(
         phys &= out["UTS_MPa"] > 0
     if "El_pct" in out:
         phys &= out["El_pct"] > 0
-    if "cooling_rate_Cps" in out:
-        phys &= out["cooling_rate_Cps"] > 0
+    for col in LOG_FEATURES:
+        if col in out:
+            phys &= out[col] > 0
     out = out[phys]
     report.n_physical_violations = n0 - len(out)
 
@@ -130,30 +159,56 @@ def clean_dataset(
     return out.reset_index(drop=True)
 
 
+def gross_error_mask(
+    df: pd.DataFrame,
+    columns: Iterable[str] | None = None,
+    threshold: float = 8.0,
+) -> np.ndarray:
+    """Máscara de inliers por z-score robusto (mediana/MAD) em escala log10.
+
+    Captura erros grosseiros univariados (digitação, unidade trocada: ksi × MPa,
+    fração × %), que o IsolationForest pode deixar passar quando há muitas
+    dimensões irrelevantes. Aplica-se a grandezas positivas (alvos).
+    """
+    cols = list(columns) if columns is not None else [t for t in TARGETS if t in df]
+    mask = np.ones(len(df), dtype=bool)
+    for c in cols:
+        x = np.log10(np.clip(df[c].to_numpy(float), 1e-9, None))
+        med = np.median(x)
+        mad = 1.4826 * np.median(np.abs(x - med))
+        if mad <= 0:
+            continue
+        mask &= np.abs(x - med) / mad <= threshold
+    return mask
+
+
 def remove_outliers(
     df: pd.DataFrame,
     columns: Iterable[str] | None = None,
     contamination: float | str = 0.02,
     seed: int = 42,
+    gross_error_threshold: float | None = 8.0,
 ) -> tuple[pd.DataFrame, np.ndarray]:
-    """Remove outliers multivariados com IsolationForest.
+    """Remove outliers: gate univariado robusto nos alvos + IsolationForest multivariado.
 
     Returns
     -------
-    (df_limpo, máscara_inliers)
+    (df_limpo, máscara_inliers) — a máscara refere-se às linhas de ``df``.
     """
     cols = list(columns) if columns is not None else [
         c for c in (*INPUT_FEATURES, *TARGETS) if c in df
     ]
-    if len(df) < 10:
-        return df.copy(), np.ones(len(df), dtype=bool)
-    X = df[cols].to_numpy(float)
-    X = X.copy()
-    for j, c in enumerate(cols):
-        if c in LOG_FEATURES:
-            X[:, j] = np.log10(np.clip(X[:, j], 1e-6, None))
-    forest = IsolationForest(contamination=contamination, random_state=seed, n_estimators=300)
-    mask = forest.fit_predict(X) == 1
+    mask = np.ones(len(df), dtype=bool)
+    if gross_error_threshold is not None:
+        mask &= gross_error_mask(df, threshold=gross_error_threshold)
+    if mask.sum() >= 10:
+        X = df.loc[mask, cols].to_numpy(float).copy()
+        for j, c in enumerate(cols):
+            if c in LOG_FEATURES:
+                X[:, j] = np.log10(np.clip(X[:, j], 1e-6, None))
+        forest = IsolationForest(contamination=contamination, random_state=seed, n_estimators=300)
+        idx = np.flatnonzero(mask)
+        mask[idx[forest.fit_predict(X) != 1]] = False
     return df.loc[mask].reset_index(drop=True), mask
 
 
@@ -256,7 +311,7 @@ def preprocess(
     save_dir: Path | None = PROCESSED_DIR,
     name: str = "dataset",
 ) -> ProcessedDataset:
-    """Executa limpeza -> outliers -> features metalúrgicas -> estatísticas."""
+    """Executa limpeza -> outliers (IsolationForest) -> features metalúrgicas -> estatísticas."""
     report = CleaningReport()
     clean = clean_dataset(df, report=report)
     n0 = len(clean)

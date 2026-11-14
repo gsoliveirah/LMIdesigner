@@ -1,10 +1,10 @@
 # Núcleo numérico
 numpy>=1.26
 pandas>=2.1
-scipy>=1.11            # qmc.LatinHypercube
+scipy>=1.11            # qmc.LatinHypercube, linprog (HiGHS)
 
 # Termodinâmica computacional
-pycalphad>=0.11        # requer base TDB de aços (ex.: MatCalc mc_fe, Thermo-Calc TCFE)
+pycalphad>=0.11        # requer base TDB de ligas de Al (ex.: COST 507, TCAL, PanAl)
 
 # Machine learning
 torch>=2.2

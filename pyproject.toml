@@ -1,7 +1,7 @@
 [project]
 name = "alloy-inverse-design"
 version = "0.1.0"
-description = "Design inverso de aços AHSS via PINN + CALPHAD + NSGA-III"
+description = "Design inverso de ligas de alumínio reciclado via PINN + CALPHAD + NSGA-III"
 requires-python = ">=3.10"
 
 [tool.pytest.ini_options]

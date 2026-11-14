@@ -1,26 +1,30 @@
-"""Rede Neural Físico-Informada (PINN) para propriedades de aços AHSS.
+"""Rede Neural Físico-Informada (PINN) para ligas de fundição Al-Si secundárias.
 
 Arquitetura
 -----------
-Entrada física bruta (wt%, °C, °C/s, µm)
-  -> normalização interna (buffers; log10 opcional)
+Entrada física bruta (wt%, °C/s, °C, h)
+  -> normalização interna (buffers; log10 para taxa de resfriamento e tempo)
   -> tronco MLP residual (SiLU + LayerNorm + Dropout)
-  -> cabeça mecânica  : [YS, UTS, El]
-  -> cabeça de fases  : softmax[ferrita, bainita, martensita, austenita retida]
+  -> cabeça mecânica : [YS, UTS, El]
+  -> cabeça de fases : softmax[Al-α, Si eutético, β-AlFeSi, α-AlFe(Mn)Si, Al2Cu]
 
 Como a normalização está *dentro* do modelo, ``autograd`` fornece derivadas
-em unidades físicas e o otimizador inverso pode consultar o modelo
-diretamente com composições reais.
+em unidades físicas e o otimizador inverso consulta o modelo diretamente com
+composições reais.
 
 Termos físicos da função de perda
 ---------------------------------
-1. ``ys_le_uts``   — desigualdade YS ≤ UTS.
-2. ``rule_of_mixtures`` — UTS/YS consistentes com as frações de fase
-   previstas e a resistência dos constituintes (balanço de massa de C).
-3. ``elongation_law`` — compromisso resistência-ductilidade + efeito TRIP.
-4. ``monotonicity`` — sinais de derivadas via autograd (ex.: ∂UTS/∂C ≥ 0,
-   Hall–Petch ∂YS/∂d ≤ 0).
-5. ``non_negative`` — El ≥ 0.
+1. ``ys_le_uts``       — desigualdade YS ≤ UTS.
+2. ``strength_model``  — YS consistente com a superposição de mecanismos
+   (precipitação Mg/Cu × cinética de envelhecimento, SDAS, Si eutético),
+   usando as frações de fase *previstas* (Cu dissolvido = Cu − Cu no Al2Cu).
+3. ``ductility_law``   — El consistente com o dano por intermetálicos
+   (β-AlFeSi ≫ α-Fe, Al2Cu, Si não modificado) e com a fusão incipiente.
+4. ``work_hardening``  — UTS = YS + H·(1 − e^(−El/4)).
+5. ``mass_balance``    — conservação de Fe, Cu e Si nas fases intermetálicas.
+6. ``monotonicity``    — sinais de derivadas via autograd (∂YS/∂Mg ≥ 0,
+   ∂El/∂Fe ≤ 0, ∂El/∂taxa de resfriamento ≥ 0, …).
+7. ``non_negative``    — El ≥ 0.
 A conservação de fases (Σf = 1, f ≥ 0) é imposta *rigidamente* pelo softmax.
 """
 
@@ -44,6 +48,7 @@ from src.config import (
     MONOTONIC_CONSTRAINTS,
     PHASES,
     PROCESS_BOUNDS,
+    PROCESS_FEATURES,
 )
 from src.data_pipeline.preprocessing import NormalizationStats
 
@@ -65,8 +70,10 @@ class PhysicsWeights:
 
     lambda_physics: float = 0.1
     ys_le_uts: float = 1.0
-    rule_of_mixtures: float = 1.0
-    elongation_law: float = 0.5
+    strength_model: float = 1.0
+    ductility_law: float = 0.5
+    work_hardening: float = 0.5
+    mass_balance: float = 1.0
     monotonicity: float = 1.0
     non_negative: float = 1.0
     phase_supervision: float = 1.0
@@ -158,6 +165,10 @@ def _composition_from_tensor(model: PhysicsInformedNet, x_raw: torch.Tensor) -> 
     return {el: x_raw[:, model.feature_index(el)] for el in ELEMENTS if el in model.feature_names}
 
 
+def _process_from_tensor(model: PhysicsInformedNet, x_raw: torch.Tensor) -> dict[str, torch.Tensor]:
+    return {p: x_raw[:, model.feature_index(p)] for p in PROCESS_FEATURES}
+
+
 def physics_residuals(
     model: PhysicsInformedNet,
     x_raw: torch.Tensor,
@@ -166,6 +177,7 @@ def physics_residuals(
     """Calcula os resíduos físicos em ``x_raw`` (dados ou pontos de colocação).
 
     ``x_raw`` deve ter ``requires_grad=True`` para o termo de monotonicidade.
+    Resíduos são adimensionalizados pelo desvio-padrão de cada alvo.
     """
     out = model(x_raw)
     y, phases = out.properties, out.phases
@@ -176,19 +188,27 @@ def physics_residuals(
     s_uts = model.y_std[model.target_index("UTS_MPa")]
     s_el = model.y_std[model.target_index("El_pct")]
 
-    terms: dict[str, torch.Tensor] = {}
-    terms["ys_le_uts"] = torch.mean(F.relu(ys - uts) / s_uts) ** 2
-
     comp = _composition_from_tensor(model, x_raw)
+    proc = _process_from_tensor(model, x_raw)
     phase_map = {name: phases[:, i] for i, name in enumerate(model.phase_names)}
-    d = x_raw[:, model.feature_index("grain_size_um")]
-    ys_rom, uts_rom = met.rule_of_mixtures(comp, phase_map, d)
-    terms["rule_of_mixtures"] = torch.mean(((uts - uts_rom) / s_uts) ** 2) + torch.mean(
-        ((ys - ys_rom) / s_ys) ** 2
-    )
+    cr, t_sol = proc["cooling_rate_Cps"], proc["T_solution_C"]
 
-    el_law = met.elongation_model(uts, phase_map["f_retained_austenite"])
-    terms["elongation_law"] = torch.mean(((el - el_law) / s_el) ** 2)
+    terms: dict[str, torch.Tensor] = {}
+    terms["ys_le_uts"] = torch.mean((F.relu(ys - uts) / s_uts) ** 2)
+
+    ys_model = met.yield_strength(comp, phase_map, cr, t_sol, proc["T_aging_C"], proc["t_aging_h"])
+    terms["strength_model"] = torch.mean(((ys - ys_model) / s_ys) ** 2)
+
+    el_model = met.elongation(comp, phase_map, cr, t_sol, ys)
+    terms["ductility_law"] = torch.mean(((el - el_model) / s_el) ** 2)
+
+    uts_model = met.ultimate_tensile_strength(ys, F.relu(el))
+    terms["work_hardening"] = torch.mean(((uts - uts_model) / s_uts) ** 2)
+
+    mb = met.mass_balance_residuals(comp, phase_map)
+    # violações em wt%; 0.1 wt% ~ escala de tolerância analítica (OES)
+    terms["mass_balance"] = sum(torch.mean((v / 0.1) ** 2) for v in mb.values())
+
     terms["non_negative"] = torch.mean((F.relu(-el) / s_el) ** 2)
 
     mono = torch.zeros((), device=x_raw.device)
@@ -201,7 +221,11 @@ def physics_residuals(
             grad = torch.autograd.grad(
                 y[:, t_idx].sum(), x_raw, create_graph=True, retain_graph=True
             )[0][:, f_idx]
-            scale = x_raw[:, f_idx].detach().std().clamp(min=1e-6) / model.y_std[t_idx]
+            if feature in LOG_FEATURES:  # derivada em relação a log10(x)
+                grad = grad * x_raw[:, f_idx].detach() * np.log(10.0)
+                scale = 1.0 / model.y_std[t_idx]
+            else:
+                scale = x_raw[:, f_idx].detach().std().clamp(min=1e-6) / model.y_std[t_idx]
             mono = mono + torch.mean(F.relu(-sign * grad * scale) ** 2)
     terms["monotonicity"] = mono
     return terms
@@ -222,7 +246,8 @@ def total_loss(
     logs: dict[str, float] = {"data": float(data_loss.detach())}
 
     if phases_true is not None:
-        phase_loss = F.mse_loss(out.phases, phases_true) * 10.0
+        # Distância de Hellinger (MSE em √f): sensível às fases minoritárias (β, Al2Cu ~ 0.1–5 %)
+        phase_loss = F.mse_loss(torch.sqrt(out.phases + 1e-8), torch.sqrt(phases_true.clamp(min=0) + 1e-8)) * 50.0
         loss = loss + weights.phase_supervision * phase_loss
         logs["phases"] = float(phase_loss.detach())
 

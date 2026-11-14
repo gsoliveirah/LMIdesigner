@@ -24,7 +24,7 @@ import torch
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import GroupKFold
 
-from src.config import MODELS_DIR, TrainingConfig
+from src.config import DEFAULT_MODEL_PATH, TrainingConfig
 from src.data_pipeline.preprocessing import NormalizationStats, ProcessedDataset
 from src.models.pinn import (
     PhysicsInformedNet,
@@ -228,7 +228,7 @@ class PINNTrainer:
         sampler = optuna.samplers.TPESampler(seed=self.config.seed)
         pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
         study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner,
-                                    study_name="pinn_ahss")
+                                    study_name="pinn_al")
 
         def objective(trial: optuna.Trial) -> float:
             params = self.suggest(trial)
@@ -245,7 +245,7 @@ class PINNTrainer:
         dataset: ProcessedDataset,
         tune: bool = True,
         params: HyperParams | None = None,
-        save_path: Path | None = MODELS_DIR / "pinn_ahss.pt",
+        save_path: Path | None = DEFAULT_MODEL_PATH,
     ) -> TrainResult:
         """Pipeline completo: (Optuna) -> CV final -> treino em todos os dados."""
         study = None
